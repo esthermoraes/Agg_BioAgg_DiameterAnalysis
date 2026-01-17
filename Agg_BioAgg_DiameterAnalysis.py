@@ -60,7 +60,6 @@ def feret_diameters(contour: np.ndarray) -> tuple[float, float]:
     w, h = rect[1]
     return float(max(w, h)), float(min(w, h))
 
-
 def measure_diameters(contour: np.ndarray) -> dict:
     area = float(cv2.contourArea(contour))
     d1_eq = float(np.sqrt(4 * area / np.pi)) if area > 0 else 0.0
@@ -188,7 +187,6 @@ def main():
     except Exception as e:
         messagebox.showerror("Erro", str(e))
         raise
-
 
 if __name__ == "__main__":
     main()
