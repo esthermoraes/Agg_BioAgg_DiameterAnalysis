@@ -5,48 +5,26 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-
-# =========================
-# 1) Pré-processamento
-# =========================
+# Pré-processamento
 def preprocess(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     return gray
 
-
-# =========================
-# 2) Segmentação (auto-inverte se necessário)
-# =========================
+# Segmentação (auto-inverte se necessário)
 def segment_auto(gray: np.ndarray) -> np.ndarray:
-    """
-    Otsu + auto-inversão:
-    - se a maior parte ficar branca, provavelmente o fundo ficou "objeto"
-    - então inverte
-    """
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     white_ratio = (bw > 0).mean()
     if white_ratio > 0.5:
         bw = cv2.bitwise_not(bw)
 
-    # Morfologia LEVE pra remover ruído sem grudar partículas
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=1)
-
     return bw
 
-
-# =========================
-# 3) Separar objetos colados (distance transform + watershed)
-# =========================
+# Separar objetos colados (distance transform + watershed)
 def split_touching_objects(bw: np.ndarray, fg_thresh: float = 0.45) -> np.ndarray:
-    """
-    Separa partículas que encostam.
-    fg_thresh:
-      - diminua (0.35~0.42) se estiver pegando poucos objetos
-      - aumente (0.50~0.60) se estiver quebrando demais
-    """
     bw = (bw > 0).astype(np.uint8) * 255
 
     dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
@@ -60,7 +38,7 @@ def split_touching_objects(bw: np.ndarray, fg_thresh: float = 0.45) -> np.ndarra
 
     unknown = cv2.subtract(sure_bg, sure_fg)
 
-    num_labels, markers = cv2.connectedComponents(sure_fg)
+    _, markers = cv2.connectedComponents(sure_fg)
     markers = markers + 1
     markers[unknown == 255] = 0
 
@@ -71,72 +49,52 @@ def split_touching_objects(bw: np.ndarray, fg_thresh: float = 0.45) -> np.ndarra
     separated[markers > 1] = 255
     return separated
 
-
-# =========================
-# 4) Contornos + filtro
-# =========================
+# Contornos + filtro
 def extract_particles(bw: np.ndarray, min_area: int = 50):
     contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    good = []
-    for c in contours:
-        if cv2.contourArea(c) >= min_area:
-            good.append(c)
-    return good
+    return [c for c in contours if cv2.contourArea(c) >= min_area]
 
-
-# =========================
-# 5) Medidas: D1/D2/D3 (px)
-# =========================
+# Medidas: D1/D2/D3 (px)
 def feret_diameters(contour: np.ndarray) -> tuple[float, float]:
     rect = cv2.minAreaRect(contour)
     w, h = rect[1]
     return float(max(w, h)), float(min(w, h))
 
 
-def measure_contour(contour: np.ndarray) -> dict:
+def measure_diameters(contour: np.ndarray) -> dict:
     area = float(cv2.contourArea(contour))
-    perimeter = float(cv2.arcLength(contour, True))
-
     d1_eq = float(np.sqrt(4 * area / np.pi)) if area > 0 else 0.0
     d2_feret_max, d3_feret_min = feret_diameters(contour)
-
-    x, y, w, h = cv2.boundingRect(contour)
-
-    circularity = float(4 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
-
     return {
-        "area_px2": area,
-        "perimeter_px": perimeter,
-        "circularity": circularity,
         "D1_eq_px": d1_eq,
         "D2_feret_max_px": d2_feret_max,
         "D3_feret_min_px": d3_feret_min,
-        "bbox_x": int(x),
-        "bbox_y": int(y),
-        "bbox_w": int(w),
-        "bbox_h": int(h),
     }
 
-
-# =========================
-# 6) Analisar imagem + salvar outputs
-# =========================
-def analyze_image(image_path: str, out_dir: str = "out", min_area: int = 50, fg_thresh: float = 0.45):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+# Analisar imagem + salvar o output
+def analyze_image(
+    image_path: str,
+    results_dir: str = "results",
+    min_area: int = 50,
+    fg_thresh: float = 0.45
+):
+    results_dir = Path(results_dir)
+    csv_dir = results_dir / "csv"
+    id_dir = results_dir / "identification"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    id_dir.mkdir(parents=True, exist_ok=True)
 
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(f"Não foi possível abrir a imagem: {image_path}")
 
     gray = preprocess(img)
-
     bw = segment_auto(gray)
     bw_sep = split_touching_objects(bw, fg_thresh=fg_thresh)
 
     contours = extract_particles(bw_sep, min_area=min_area)
 
-    # Ordenar por posição (top->bottom, left->right) pra ID ficar mais “bonito”
+    # Ordenar por posição (top->bottom, left->right)
     def contour_key(c):
         x, y, w, h = cv2.boundingRect(c)
         return (y, x)
@@ -146,56 +104,48 @@ def analyze_image(image_path: str, out_dir: str = "out", min_area: int = 50, fg_
     rows = []
 
     for idx, contour in enumerate(contours, start=1):
-        m = measure_contour(contour)
-        m["id"] = idx
-        rows.append(m)
+        # diâmetros
+        d = measure_diameters(contour)
+        rows.append({"id": idx, **d})
 
+        # desenhar contorno + texto
         cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 2)
+        x, y, w, h = cv2.boundingRect(contour)
 
-        x, y = m["bbox_x"], m["bbox_y"]
+        label = str(idx)
 
-        label1 = f"Agregado {idx}"
-        label2 = (
-            f"D1: {m['D1_eq_px']:.1f}px | "
-            f"D2: {m['D2_feret_max_px']:.1f}px | "
-            f"D3: {m['D3_feret_min_px']:.1f}px"
+        # posição do ID (um pouco acima do objeto)
+        y_id = max(y - 10, 20)
+
+        cv2.putText(
+            overlay,
+            label,
+            (x, y_id),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 0, 255),
+            2
         )
 
-        # “Alt melhor”: duas linhas claras, sempre visíveis
-        y1 = max(y - 28, 20)
-        y2 = max(y - 10, 40)
-
-        cv2.putText(overlay, label1, (x, y1),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
-
-        cv2.putText(overlay, label2, (x, y2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
+    # CSV só com diâmetros
     df = pd.DataFrame(rows).sort_values("id")
 
     base = Path(image_path).stem
-    csv_path = out_dir / f"{base}_dados_px.csv"
-    bin_path = out_dir / f"{base}_binary.png"
-    sep_path = out_dir / f"{base}_binary_separated.png"
-    ann_path = out_dir / f"{base}_anotada.png"
+    csv_path = csv_dir / f"{base}_diameters_px.csv"
+    ann_path = id_dir / f"{base}_identified.png"
 
     df.to_csv(csv_path, index=False)
-    cv2.imwrite(str(bin_path), bw)
-    cv2.imwrite(str(sep_path), bw_sep)
     cv2.imwrite(str(ann_path), overlay)
 
     return {
         "csv": csv_path,
-        "binary": bin_path,
-        "binary_separated": sep_path,
         "annotated": ann_path,
         "count": len(contours),
+        "csv_folder": csv_dir,
+        "identification_folder": id_dir
     }
 
-
-# =========================
-# 7) Selecionar arquivo + MAIN
-# =========================
+# Selecionar arquivo 
 def select_file() -> str | None:
     root = tk.Tk()
     root.withdraw()
@@ -206,26 +156,32 @@ def select_file() -> str | None:
     root.destroy()
     return path if path else None
 
-
+# Função principal
 def main():
     image_path = select_file()
     if not image_path:
         print("Nenhuma imagem selecionada.")
         return
 
-    # Ajustes principais:
-    MIN_AREA = 40 # se ainda estiver pegando só 1, tente 20 ou 30
-    FG_THRESH = 0.45    # se estiver juntando, tente 0.40; se quebrando demais, 0.55
+    MIN_AREA = 30
+    FG_THRESH = 0.45
 
     try:
-        result = analyze_image(image_path, out_dir="results", min_area=MIN_AREA, fg_thresh=FG_THRESH)
+        result = analyze_image(
+            image_path,
+            results_dir="results",
+            min_area=MIN_AREA,
+            fg_thresh=FG_THRESH
+        )
+
         msg = (
             f"Concluído!\n"
             f"Objetos detectados: {result['count']}\n\n"
-            f"Anotada: {result['annotated']}\n"
-            f"CSV: {result['csv']}\n"
-            f"Binary: {result['binary']}\n"
-            f"Binary separated: {result['binary_separated']}"
+            f"Imagem identificada: {result['annotated']}\n"
+            f"CSV (diâmetros): {result['csv']}\n\n"
+            f"Pastas:\n"
+            f"- {result['identification_folder']}\n"
+            f"- {result['csv_folder']}"
         )
         messagebox.showinfo("OK", msg)
         print(msg)
